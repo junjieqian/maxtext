@@ -15,6 +15,7 @@
 
 """MoE related Layers."""
 
+from absl import flags
 import enum
 import functools
 import math
@@ -43,6 +44,7 @@ import qwix.pallas as qpl
 import tokamax
 
 set_xla_metadata = xla_metadata.set_xla_metadata
+flags.FLAGS.mark_as_parsed()
 
 
 DISPATCH = "dispatch"
