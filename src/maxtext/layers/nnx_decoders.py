@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Module for decoder layers"""
+
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
@@ -64,6 +65,7 @@ from maxtext.models import (
     mistral,
     mixtral,
     olmo3,
+    pairmixer,
     qwen2,
     qwen3,
     qwen3_5,
@@ -582,6 +584,21 @@ class NNXDecoder(nnx.Module):
     self.is_gemma4_small = self.config.decoder_block == DecoderBlockType.GEMMA4_SMALL
     self.is_qwen3_next = self.config.decoder_block == DecoderBlockType.QWEN3_NEXT
     self.is_qwen3_5 = self.config.decoder_block == DecoderBlockType.QWEN3_5
+    self.is_pairmixer = self.config.decoder_block == DecoderBlockType.PAIRMIXER
+
+    if self.is_pairmixer:
+      self.pairmixer_input_projector = pairmixer.PairmixerInputProjector(
+          config=config,
+          mesh=self.mesh,
+          quant=self.quant,
+          rngs=rngs,
+      )
+      self.pairmixer_output_projector = pairmixer.PairmixerOutputProjector(
+          config=config,
+          mesh=self.mesh,
+          quant=self.quant,
+          rngs=rngs,
+      )
 
     if config.mhc_expansion_rate > 1 and config.decoder_block == DecoderBlockType.DEEPSEEK4:
       self.hc_head = mhc.DeepSeek4HyperHead(
@@ -1265,7 +1282,7 @@ class NNXDecoder(nnx.Module):
         return new_carry, (new_current_state, updated_kv)
       return new_carry, new_current_state
 
-    if skip_block_remat:
+    if skip_block_remat or (self.is_pairmixer and self.config.remat_policy in (None, "none")):
       # The scanned module applies its own remat internally; wrapping the whole
       # body again would double-remat and recompute the entire block.
       layer_fn_wrapped = layer_fn
@@ -1377,6 +1394,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
         DecoderBlockType.ENVY: get_scannable(envy.EnvyDecoderLayer, envy.EnvyScannableBlock),
         DecoderBlockType.WEAVER: [weaver.WeaverMoTDecoderLayer],
+        DecoderBlockType.PAIRMIXER: [pairmixer.PairmixerDecoderLayer],
     }
 
     if cfg.decoder_block not in layer_map:
@@ -1397,6 +1415,14 @@ class NNXDecoder(nnx.Module):
         "mlpwi_1",
         "mlpwi",
         "mlpwo",
+        "tri_out_pgg",
+        "tri_out_ab",
+        "tri_out_contraction",
+        "tri_out_p_out",
+        "tri_in_pgg",
+        "tri_in_ab",
+        "tri_in_contraction",
+        "tri_in_p_out",
     ]
     if with_context:
       names.append("context")
@@ -1552,6 +1578,15 @@ class NNXDecoder(nnx.Module):
           num_features=num_features,
           shard_mode=self.config.shard_mode,
           reductions_in_fp32=False,
+          use_bias=True,
+          rngs=rngs,
+      )
+    elif self.config.decoder_block == DecoderBlockType.PAIRMIXER:
+      return functools.partial(
+          pairmixer.PairmixerLayerNorm,
+          num_features=num_features,
+          shard_mode=self.config.shard_mode,
+          reductions_in_fp32=True,
           use_bias=True,
           rngs=rngs,
       )
@@ -1974,6 +2009,13 @@ class NNXDecoder(nnx.Module):
         decoder_input_embeddings=decoder_input_embeddings,
     )
 
+    pairmixer_cm = False
+    pairmixer_ctx = None
+    if self.is_pairmixer:
+      y, decoder_segment_ids, decoder_positions, pairmixer_cm, pairmixer_ctx = pairmixer.prepare_pairmixer_input(
+          self, cfg, y, decoder_segment_ids, decoder_positions, deterministic
+      )
+
     if hasattr(cfg, "mhc_expansion_rate"):
       mhc_expand, _ = mhc.get_functions(cfg.mhc_expansion_rate)
       if cfg.mhc_expansion_rate > 1:
@@ -1986,6 +2028,8 @@ class NNXDecoder(nnx.Module):
         "slot": slot,
         "previous_chunk": previous_chunk,
     }
+    if pairmixer_cm and cfg.scan_layers:
+      layer_kwargs["channel_major"] = True
     # Extract the bidirectional mask locally for layer configurations
     bidirectional_mask = None
     if multimodal_input is not None:
@@ -2303,6 +2347,12 @@ class NNXDecoder(nnx.Module):
                 forced_routed_experts_scanned=forced_routed_experts_scanned,
                 **layer_kwargs,
             )
+      elif (
+          pairmixer_cm
+          and not getattr(self, "disable_quant_stats_update", False)
+          and (cfg.pairmixer_token_z >= 512 or cfg.remat_policy in (None, "none"))
+      ):
+        y = pairmixer.run_pairmixer_trunk(self, cfg, y, decoder_segment_ids, layer_args)
       else:
         prevent_cse = maxtext_utils.should_prevent_cse_in_remat(cfg)
         dynamic_graph_init = bool(getattr(self, "disable_quant_stats_update", False))
@@ -2314,7 +2364,8 @@ class NNXDecoder(nnx.Module):
                 state_in,
             )
           merged_layer = nnx.merge(graphdef_in, state_in)
-          out_y, out_kv = merged_layer(y_in, *layer_args, kv_cache=kv_in, **valid_kwargs)
+          extra_cm = {"channel_major": True} if pairmixer_cm else {}
+          out_y, out_kv = merged_layer(y_in, *layer_args, kv_cache=kv_in, **extra_cm, **valid_kwargs)
           state_out = nnx.state(merged_layer)
 
           if dynamic_graph_init:
@@ -2439,6 +2490,9 @@ class NNXDecoder(nnx.Module):
               y = deepstack_process(y, bidirectional_mask, visual_embeds)
 
     assert isinstance(y, jax.Array)
+
+    if self.is_pairmixer:
+      y, decoder_segment_ids = pairmixer.run_pairmixer_output(self, y, decoder_segment_ids, pairmixer_cm, pairmixer_ctx)
 
     # After the final transformer layer, `y` holds the raw, un-normalized hidden state.
     # For DeepSeek-V4 it is deliberately left in its expanded 4D

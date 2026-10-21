@@ -104,21 +104,30 @@ class SyntheticDataIterator:
     else:
       segmentation = jnp.ones((config.global_batch_size_to_load, config.max_target_length), dtype=jnp.int32)
     self.data = (tokens, batch_positions, segmentation)
+    self._step = 0
 
   def reset(self):
-    pass  # Synthetic data is stateless; nothing to reset.
+    self._step = 0
 
   def __iter__(self):
     return self
 
   def __next__(self):
+    step = self._step
+    self._step += 1
     with self.mesh:
-      return self.data_generator(self.config, self.data)  # pylint: disable=not-callable
+      return self.data_generator(self.config, self.data, step)  # pylint: disable=not-callable
 
   @staticmethod
-  def raw_generate_synthetic_data(config: pyconfig.HyperParameters, data):
+  def raw_generate_synthetic_data(config: pyconfig.HyperParameters, data, step=0):
     """Generates a single batch of synthetic data"""
     tokens, positions, segmentation = data
+    mask_prob = float(getattr(config, "pairmixer_random_mask_prob", 0.0))
+    if mask_prob > 0.0:
+      # Lazy import: keeps model/layer modules out of the input pipeline import graph.
+      from maxtext.models import pairmixer as pairmixer_module  # pylint: disable=import-outside-toplevel
+
+      segmentation = pairmixer_module.apply_synthetic_random_mask(config, segmentation, step)
 
     output = {}
     output["inputs"] = tokens[:, :-1]

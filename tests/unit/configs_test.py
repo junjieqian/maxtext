@@ -271,6 +271,18 @@ def test_kimi_configs(config_file):
   run_config_validation(config_file)
 
 
+# --- Test Group 8b: Pairmixer Model Family ---
+
+PAIRMIXER_CONFIGS = [
+    os.path.join(CONFIGS_DIR, "models", "pairmixer.yml"),
+]
+
+
+@pytest.mark.parametrize("config_file", PAIRMIXER_CONFIGS)
+def test_pairmixer_configs(config_file):
+  run_config_validation(config_file)
+
+
 # --- Test Group 9: Inference-specific Configs ---
 
 INFERENCE_CONFIGS = [

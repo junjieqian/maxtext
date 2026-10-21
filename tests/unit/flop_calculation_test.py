@@ -1333,6 +1333,23 @@ class FlopCalculation(parameterized.TestCase):
     """
     self._verify_long_sequence_flops(model_name)
 
+  @parameterized.parameters(
+      (384, 20.873937420288, 16.699229208576, 4.174708211712),
+      (512, 39.58294708224, 29.687342432256, 9.895604649984),
+      (768, 100.193789804544, 66.796124110848, 33.397665693696),
+  )
+  def test_pairmixer_flops(self, seq_len, expected_total, expected_weight, expected_attn):
+    """Validates exact Pairmixer training TFLOPs per device for Phase 1/2/3 crop lengths."""
+    cfg = self._initialize_model_config(
+        "pairmixer",
+        max_target_length=seq_len,
+        per_device_batch_size=1,
+    )
+    total_tflops, weight_tflops, attn_tflops = calculate_tflops_training_per_device(cfg, log=False)
+    self.assertAlmostEqual(total_tflops, expected_total, places=6)
+    self.assertAlmostEqual(weight_tflops, expected_weight, places=6)
+    self.assertAlmostEqual(attn_tflops, expected_attn, places=6)
+
 
 class DeepSeekV4ProConfigSmokeTest(unittest.TestCase):
   """Validates deepseek4-1600b config and component initialization."""

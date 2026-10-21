@@ -1149,6 +1149,40 @@ def calculate_deepseek4_tflops_training_per_device(config, total_ffn_flops_all_l
   )
 
 
+def calculate_pairmixer_tflops_training_per_device(config, embedding_flops: float) -> tuple[float, float]:
+  """Calculates Pairmixer training TFLOPs per device (triangular contractions + learnable weights)."""
+  b = config.per_device_batch_size
+  n = config.max_target_length
+  k_compact = int(getattr(config, "pairmixer_compact_tokens", 0))
+  n_trunk = k_compact if 0 < k_compact < n else n
+  c_z = config.pairmixer_token_z
+  c_s = config.emb_dim
+  mlp_dim = config.mlp_dim
+  num_layers = config.num_decoder_layers
+
+  # Per layer:
+  # - TriangleMultiplicationOutgoing + Incoming projections:
+  #   2 * (p_in(c_z->2*c_z) + g_in(c_z->2*c_z) + p_out(c_z->c_z) + g_out(c_z->c_z)) = 24 * B * N^2 * c_z^2
+  # - PairmixerTransition (SwiGLU fc1, fc2, fc3): 6 * B * N^2 * c_z * mlp_dim
+  tri_proj_flops_per_layer = 24 * b * (n_trunk**2) * (c_z**2)
+  transition_flops_per_layer = 6 * b * (n_trunk**2) * c_z * mlp_dim
+  per_layer_weight_flops = tri_proj_flops_per_layer + transition_flops_per_layer
+
+  # Input pair lift (s_to_z_1, s_to_z_2) + output pair readout (z_to_s): 3 * 2 * B * N * c_s * c_z
+  lift_readout_flops = 6 * b * n_trunk * c_s * c_z
+
+  # Outgoing + Incoming non-causal N x N triangular contractions: 2 * (2 * B * N^3 * c_z) = 4 * B * N^3 * c_z
+  tri_contraction_flops_per_layer = 4 * b * (n_trunk**3) * c_z
+
+  total_attn_flops = tri_contraction_flops_per_layer * num_layers
+  total_weight_flops = per_layer_weight_flops * num_layers + lift_readout_flops + embedding_flops
+
+  return (
+      total_attn_flops * 3 / 10**12,
+      total_weight_flops * 3 / 10**12,
+  )
+
+
 def calculate_tflops_training_per_device(config, log=True):
   """Calculate training TFLOP"""
   # MLP flops
@@ -1256,6 +1290,8 @@ def calculate_tflops_training_per_device(config, log=True):
     attention_tflops, learnable_weight_tflops = calculate_deepseek4_tflops_training_per_device(
         config, total_ffn_flops_all_layers, embedding_flops
     )
+  elif config.decoder_block == DecoderBlockType.PAIRMIXER:
+    attention_tflops, learnable_weight_tflops = calculate_pairmixer_tflops_training_per_device(config, embedding_flops)
   elif config.decoder_block == DecoderBlockType.DEEPSEEK:
     learnable_weight_tflops = (
         (total_ffn_flops_all_layers + (qkv_flops + projection_flops) * config.num_decoder_layers + embedding_flops)

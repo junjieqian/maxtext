@@ -319,6 +319,7 @@ ModelName = Literal[
     "envy-switch-base",
     "envy-switch-large",
     "envy-switch-xxl",
+    "pairmixer",
 ]
 
 
@@ -702,6 +703,34 @@ class ModelArchitecture(BaseModel):
   v_norm_with_scale: bool = Field(
       True,
       description="Whether to apply scale on value normalization (default True).",
+  )
+  pairmixer_token_z: int = Field(
+      128,
+      description="Pairwise representation channel dimension (token_z) for Pairmixer.",
+  )
+  pairmixer_fp32_einsum: bool = Field(
+      True,
+      description="If True, upcast triangle multiplication inputs to float32 before einsum (reference fidelity).",
+  )
+  pairmixer_fused_projections: bool = Field(
+      False,
+      description="If True, fuse Pairmixer p_in/g_in, p_out/g_out, and fc1/fc2 linear projections.",
+  )
+  pairmixer_use_pallas: bool = Field(
+      False,
+      description="If True, use fused Pallas TPU kernels for Pairmixer TriangleMultiplication and Transition.",
+  )
+  pairmixer_random_mask_prob: float = Field(
+      0.0,
+      description="Fraction of tokens randomly masked out (0..1) in synthetic data, zeroing rows and columns in pair space.",
+  )
+  pairmixer_random_mask_mode: str = Field(
+      "bernoulli",
+      description="Random token mask sampling mode ('bernoulli' for independent Bernoulli, 'exact' for fixed active count).",
+  )
+  pairmixer_compact_tokens: int = Field(
+      0,
+      description="If > 0, compact active unmasked tokens to a dense K x K pair grid around the Pairmixer trunk.",
   )
 
 
@@ -6695,10 +6724,8 @@ class RLConfig(
         self.tokenizer_path = HF_IDS[model_name]
         self.tokenizer_type = TokenizerType.HUGGINGFACE
       else:
-        raise ValueError(
-            "model_name not found in HF_IDS in maxtext/src/maxtext/utils/globals.py. \
-          Please pass tokenizer_path in your command."
-        )
+        raise ValueError("model_name not found in HF_IDS in maxtext/src/maxtext/utils/globals.py. \
+          Please pass tokenizer_path in your command.")
 
     if self.optimizer_memory_host_offload:
       raise ValueError(
