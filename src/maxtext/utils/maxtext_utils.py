@@ -1302,6 +1302,21 @@ def calculate_tflops_training_per_device(config, log=True):
     # Attention TFLOPs:
     total_attn = (causal_attention_flops * num_full_attn_layers) + (gdn_attn_flops_per_layer * num_linear_attn_layers)
     attention_tflops = total_attn * 3 / 10**12
+  elif config.decoder_block == DecoderBlockType.GBRNA:
+    # Encoder-only model: attention is bidirectional, so undo the causal halving of the attention FLOPs.
+    # The MLM head adds an emb_dim x emb_dim transform before the tied unembedding.
+    mlm_head_flops = 2 * config.per_device_batch_size * config.max_target_length * config.emb_dim * config.emb_dim
+    learnable_weight_tflops = (
+        (
+            total_ffn_flops_all_layers
+            + (qkv_flops + projection_flops) * config.num_decoder_layers
+            + embedding_flops
+            + mlm_head_flops
+        )
+        * 3
+        / 10**12
+    )
+    attention_tflops = 2 * causal_attention_flops * config.num_decoder_layers * 3 / 10**12
   else:
     # multiply by 3 for both feed forward and back propagation flops
     learnable_weight_tflops = (

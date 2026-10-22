@@ -52,6 +52,7 @@ from maxtext.models import (
     deepseek_batchsplit,
     deepseek_batchsplit_fp8,
     envy,
+    gbrna,
     gemma,
     gemma2,
     gemma3,
@@ -573,6 +574,28 @@ class NNXDecoder(nnx.Module):
           weight_grad_in_kernel_order=config.lm_head_weight_grad_in_kernel_order,
           rngs=rngs,
       )
+    if config.decoder_block == DecoderBlockType.GBRNA:
+      # GB.RNA MLM head: dense -> GELU -> LayerNorm. The logits use the tied embedding plus an output bias.
+      self.mlm_head_dense = linears.DenseGeneral(
+          in_features_shape=config.emb_dim,
+          out_features_shape=config.emb_dim,
+          weight_dtype=config.weight_dtype,
+          dtype=config.dtype,
+          kernel_axes=("embed", "mlp"),
+          use_bias=True,
+          shard_mode=config.shard_mode,
+          matmul_precision=config.matmul_precision,
+          parameter_memory_host_offload=config.parameter_memory_host_offload,
+          rngs=rngs,
+      )
+      self.mlm_head_norm = self.get_norm_layer(num_features=config.emb_dim, rngs=rngs)(
+          dtype=config.dtype,
+          weight_dtype=config.weight_dtype,
+          epsilon=config.normalization_layer_epsilon,
+          kernel_axes=("norm",),
+          parameter_memory_host_offload=config.parameter_memory_host_offload,
+      )
+      self.mlm_head_bias = nnx.Param(jnp.zeros((config.vocab_size,), config.weight_dtype), sharding=("vocab",))
 
     self.scanned_layers = None
     self.is_deepseek = self.config.decoder_block == DecoderBlockType.DEEPSEEK
@@ -1377,6 +1400,7 @@ class NNXDecoder(nnx.Module):
         DecoderBlockType.OLMO3: get_scannable(olmo3.Olmo3DecoderLayer, olmo3.Olmo3ScannableBlock),
         DecoderBlockType.ENVY: get_scannable(envy.EnvyDecoderLayer, envy.EnvyScannableBlock),
         DecoderBlockType.WEAVER: [weaver.WeaverMoTDecoderLayer],
+        DecoderBlockType.GBRNA: [gbrna.GbRnaEncoderLayer],
     }
 
     if cfg.decoder_block not in layer_map:
@@ -1552,6 +1576,15 @@ class NNXDecoder(nnx.Module):
           num_features=num_features,
           shard_mode=self.config.shard_mode,
           reductions_in_fp32=False,
+          use_bias=True,
+          rngs=rngs,
+      )
+    elif self.config.decoder_block == DecoderBlockType.GBRNA:
+      return functools.partial(
+          gpt3.Gpt3LayerNorm,
+          num_features=num_features,
+          shard_mode=self.config.shard_mode,
+          reductions_in_fp32=True,
           use_bias=True,
           rngs=rngs,
       )
@@ -1758,6 +1791,9 @@ class NNXDecoder(nnx.Module):
     if normalize_y:
       y = self.apply_decoder_norm(y, reduce_mhc=False)
     y = self.dropout(y, deterministic=deterministic)  # NNX call
+    if cfg.decoder_block == DecoderBlockType.GBRNA:
+      # MLM head transform. GB.RNA uses the exact (erf) GELU.
+      y = self.mlm_head_norm(jax.nn.gelu(self.mlm_head_dense(y), approximate=False))
 
     head_in_axes, _, head_out_axes = self.lm_head_axes
     if model_mode in {MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE}:
@@ -1785,6 +1821,9 @@ class NNXDecoder(nnx.Module):
             y, head_in_axes, self.mesh, cfg.shard_mode, debug_sharding=cfg.debug_sharding
         )
       logits = self.logits_dense(y, out_sharding=out_sharding)
+
+    if cfg.decoder_block == DecoderBlockType.GBRNA:
+      logits = logits + jnp.asarray(self.mlm_head_bias[...], logits.dtype)
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)

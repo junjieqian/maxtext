@@ -369,6 +369,22 @@ class FlopCalculation(parameterized.TestCase):
     calculated_tflops, _, _ = calculate_tflops_training_per_device(cfg)
     self.assertFlopsAlmostEqual(calculated_tflops, golden_tflops)
 
+  def test_gbrna_1_6b_flops(self):
+    """Test GB.RNA 1.6B Flops: bidirectional attention (not halved) and the MLM head transform."""
+    cfg = self._initialize_model_config("gbrna-1.6b", max_target_length=1024, per_device_batch_size=1)
+    B, S, D, L = 1, 1024, 2048, 32
+    H, D_head, F, V = 32, 64, 5440, 16
+    # Forward FLOPs per token of one layer: QKV, output projection, SwiGLU MLP, and full (non-causal) attention.
+    layer_flops = 2 * D * 3 * H * D_head + 2 * H * D_head * D + 3 * 2 * D * F + 4 * S * H * D_head
+    # MLM head: dense transform and tied unembedding.
+    head_flops = 2 * D * D + 2 * D * V
+    golden_tflops = 3 * B * S * (L * layer_flops + head_flops) / 1e12  # 10.469 GFLOPs per token
+    golden_attention_tflops = 3 * B * S * L * 4 * S * H * D_head / 1e12
+    calculated_tflops, _, attention_tflops = calculate_tflops_training_per_device(cfg)
+    self.assertFlopsAlmostEqual(calculated_tflops, golden_tflops, rel_tol=1e-9)
+    self.assertFlopsAlmostEqual(attention_tflops, golden_attention_tflops, rel_tol=1e-9)
+    self.assertAlmostEqual(calculated_tflops, 10.720439697408, places=9)
+
   def test_deepseek2_16b_flops(self):
     """Test DeepSeek2-16b FLops calculation"""
     cfg = self._initialize_model_config(

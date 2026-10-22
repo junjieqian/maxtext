@@ -305,3 +305,15 @@ INFERENCE_CONFIGS = [
 @pytest.mark.parametrize("config_file", INFERENCE_CONFIGS)
 def test_inference_configs(config_file):
   run_config_validation(config_file)
+
+
+# --- Test Group 10: GB.RNA (encoder-only) ---
+
+GBRNA_CONFIGS = [
+    os.path.join(CONFIGS_DIR, "models", "gbrna-1.6b.yml"),
+]
+
+
+@pytest.mark.parametrize("config_file", GBRNA_CONFIGS)
+def test_gbrna_configs(config_file):
+  run_config_validation(config_file)

@@ -319,6 +319,7 @@ ModelName = Literal[
     "envy-switch-base",
     "envy-switch-large",
     "envy-switch-xxl",
+    "gbrna-1.6b",
 ]
 
 
