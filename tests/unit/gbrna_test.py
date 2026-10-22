@@ -312,6 +312,58 @@ class GbRnaTest(parameterized.TestCase):
     changed_logits = self._logits(model, mesh, changed_ids, segment_ids)
     self.assertGreater(np.abs(changed_logits[:, 0, :] - logits[:, 0, :]).max(), 1e-3)
 
+  def test_fused_attention_matches_default_path(self):
+    """`gbrna_fused_attention` (Pallas kernel, interpret mode) gives the logits and grads of the default path."""
+
+    def build(fused):
+      cfg = pyconfig.initialize(
+          [sys.argv[0], get_test_config_path()],
+          run_name="gbrna_test",
+          model_name="gbrna-1.6b",
+          override_model_config=True,
+          enable_checkpointing=False,
+          skip_jax_distributed_system=True,
+          dtype="float32",
+          weight_dtype="float32",
+          matmul_precision="highest",
+          attention="dot_product",
+          scan_layers=False,
+          base_num_decoder_layers=1,
+          base_emb_dim=128,
+          base_num_query_heads=2,
+          base_num_kv_heads=2,
+          head_dim=64,
+          base_mlp_dim=256,
+          max_target_length=128,
+          per_device_batch_size=1,
+          gbrna_fused_attention=fused,
+          gbrna_attention_heads_per_step=2,
+          gbrna_attention_block_q=128,
+          gbrna_attention_block_q_bwd=64,
+      )
+      mesh = Mesh(maxtext_utils.create_device_mesh(cfg, devices=[jax.devices()[0]]), cfg.mesh_axes)
+      return models.Transformer(cfg, mesh, quant=None, rngs=nnx.Rngs(params=0, dropout=0)), mesh
+
+    ids = jnp.asarray(np.random.default_rng(3).integers(0, _VOCAB, size=(1, 128)), jnp.int32)
+    pos = jnp.arange(128, dtype=jnp.int32)[None]
+    seg = jnp.ones_like(ids)
+    results = []
+    for fused in (False, True):
+      model, mesh = build(fused)
+
+      def loss(m):
+        logits = m(decoder_input_tokens=ids, decoder_positions=pos, decoder_segment_ids=seg, enable_dropout=False)
+        return jnp.mean(jax.nn.log_softmax(logits)[..., 0]), logits
+
+      with jax.set_mesh(mesh):
+        (_, logits), grads = nnx.value_and_grad(loss, has_aux=True)(model)
+      grads = nnx.state(grads, nnx.Param)
+      results.append((logits, grads))
+    (ref_logits, ref_grads), (logits, grads) = results
+    np.testing.assert_allclose(logits, ref_logits, rtol=1e-4, atol=1e-4)
+    for got, want in zip(jax.tree.leaves(grads), jax.tree.leaves(ref_grads)):
+      np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-5)
+
   def test_full_model_param_count(self):
     """gbrna-1.6b has the parameter count of the HF checkpoint (1,611,593,744)."""
     cfg = pyconfig.initialize(

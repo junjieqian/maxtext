@@ -25,10 +25,12 @@ The Q, K, V, O, and MLP projections have a bias when `attention_bias` and `mlp_b
 
 import functools
 from flax import nnx
+import jax
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
-from jax.sharding import Mesh
+from jax.sharding import Mesh, PartitionSpec
 from maxtext.common.common_types import AttentionType, Config, MODEL_MODE_PREFILL
+from maxtext.kernels import gbrna_attention
 from maxtext.layers import quantizations
 from maxtext.layers.attentions import Attention
 from maxtext.layers.linears import Dropout, MlpBlock
@@ -161,19 +163,22 @@ class GbRnaEncoderLayer(nnx.Module):
     lnx = self._maybe_shard_with_logical(lnx, self.activation_axis_names)
 
     # Self-attention block
-    attention_lnx, kv_cache = self.self_attention(
-        lnx,
-        lnx,
-        decoder_positions,
-        decoder_segment_ids=decoder_segment_ids,
-        deterministic=deterministic,
-        model_mode=model_mode,
-        slot=slot,
-        previous_chunk=previous_chunk,
-        out_sharding=lnx_sharding,
-        kv_cache=kv_cache,
-        attention_metadata=attention_metadata,
-    )
+    if cfg.gbrna_fused_attention:
+      attention_lnx = self._fused_self_attention(lnx, lnx_sharding)
+    else:
+      attention_lnx, kv_cache = self.self_attention(
+          lnx,
+          lnx,
+          decoder_positions,
+          decoder_segment_ids=decoder_segment_ids,
+          deterministic=deterministic,
+          model_mode=model_mode,
+          slot=slot,
+          previous_chunk=previous_chunk,
+          out_sharding=lnx_sharding,
+          kv_cache=kv_cache,
+          attention_metadata=attention_metadata,
+      )
 
     attention_lnx = self._maybe_shard_with_logical(attention_lnx, self.activation_axis_names)
     intermediate_inputs = inputs + attention_lnx
@@ -208,3 +213,35 @@ class GbRnaEncoderLayer(nnx.Module):
     if cfg.scan_layers:
       return layer_output, None
     return layer_output, kv_cache
+
+  def _fused_self_attention(self, lnx, out_sharding):
+    """Q/K/V projections -> fused RoPE + attention Pallas kernel -> output projection.
+
+    The kernel uses positions 0..S-1 and no padding mask. Use it only for full-length,
+    unpadded sequences (for example, synthetic data or fixed 1024-token crops).
+    """
+    cfg = self.config
+    attn = self.self_attention
+    query = checkpoint_name(attn.query_projection(lnx), "query_proj")
+    key = checkpoint_name(attn.kv_projection(lnx, proj_name="key"), "key_proj")
+    value = checkpoint_name(attn.kv_projection(lnx, proj_name="value"), "value_proj")
+    b, s, h, d = query.shape
+
+    spec4 = attn._logical_to_mesh_axes(attn.query_axis_names)  # pylint: disable=protected-access
+    if spec4[1] is not None or spec4[3] is not None:
+      raise ValueError(f"gbrna_fused_attention needs unsharded sequence and head_dim, got {spec4}.")
+    spec3 = PartitionSpec(spec4[0], None, spec4[2])
+    kernel = functools.partial(
+        gbrna_attention.gbrna_attention,
+        sm_scale=1.0,  # MaxText folds 1/sqrt(head_dim) into the query projection.
+        heads_per_step=cfg.gbrna_attention_heads_per_step,
+        block_q=cfg.gbrna_attention_block_q,
+        block_q_bwd=cfg.gbrna_attention_block_q_bwd,
+        interpret=jax.default_backend() != "tpu",  # Lets CPU tests run the kernel.
+    )
+    sharded_kernel = jax.shard_map(
+        lambda q, k, v: kernel(q, k, v), mesh=self.mesh, in_specs=(spec3,) * 3, out_specs=spec3, check_vma=False
+    )
+    out = sharded_kernel(*(x.reshape(b, s, h * d) for x in (query, key, value)))
+    out = checkpoint_name(out.reshape(b, s, h, d), "attention_out")
+    return attn.out_projection(out, out_sharding=out_sharding)

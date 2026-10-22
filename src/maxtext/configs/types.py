@@ -975,6 +975,12 @@ class SplashAttention(BaseModel):
   sa_block_q_dq: int = Field(512, description="Block size for Q_dq in splash attention.")
   sa_block_kv_dq: int = Field(512, description="Block size for KV_dq in splash attention.")
   sa_use_fused_bwd_kernel: bool = Field(False, description="Use fused backward kernel in splash attention.")
+  gbrna_fused_attention: bool = Field(
+      False, description="GB.RNA only: use the fused RoPE + attention Pallas kernel (kernels/gbrna_attention.py)."
+  )
+  gbrna_attention_heads_per_step: int = Field(4, description="Heads per grid step in the GB.RNA attention kernel.")
+  gbrna_attention_block_q: int = Field(1024, description="Query block of the GB.RNA attention forward kernel.")
+  gbrna_attention_block_q_bwd: int = Field(1024, description="Query block of the GB.RNA attention backward kernel.")
   sa_bwd_dkv_megacore: bool = Field(
       False,
       description="Megacore-parallel kv-head groups in the static dkv grid. Needs >1 KV head; useful at local batch 1.",
