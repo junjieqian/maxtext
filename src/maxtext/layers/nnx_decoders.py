@@ -2399,7 +2399,8 @@ class NNXDecoder(nnx.Module):
                 routed_experts[:, :, lyr, :] if routed_experts.ndim == 4 else routed_experts
             )
 
-          if cfg.remat_policy != "none":
+          # The config parser turns `remat_policy: none` into None; both mean no remat.
+          if cfg.remat_policy and cfg.remat_policy != "none":
             y, kv_cache, new_state, new_graphdef = checkpointed_fn(graphdef, state, y, kv_cache, current_kwargs)
           else:
             y, kv_cache, new_state, new_graphdef = pure_layer_fn(graphdef, state, y, kv_cache, current_kwargs)
