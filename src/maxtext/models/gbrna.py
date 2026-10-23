@@ -164,7 +164,7 @@ class GbRnaEncoderLayer(nnx.Module):
 
     # Self-attention block
     if cfg.gbrna_fused_attention:
-      attention_lnx = self._fused_self_attention(lnx, lnx_sharding)
+      attention_lnx = self._fused_self_attention(lnx)
     else:
       attention_lnx, kv_cache = self.self_attention(
           lnx,
@@ -214,7 +214,7 @@ class GbRnaEncoderLayer(nnx.Module):
       return layer_output, None
     return layer_output, kv_cache
 
-  def _fused_self_attention(self, lnx, out_sharding):
+  def _fused_self_attention(self, lnx):
     """Q/K/V projections -> fused RoPE + attention Pallas kernel -> output projection.
 
     The kernel uses positions 0..S-1 and no padding mask. Use it only for full-length,
@@ -222,10 +222,23 @@ class GbRnaEncoderLayer(nnx.Module):
     """
     cfg = self.config
     attn = self.self_attention
-    query = checkpoint_name(attn.query_projection(lnx), "query_proj")
-    key = checkpoint_name(attn.kv_projection(lnx, proj_name="key"), "key_proj")
-    value = checkpoint_name(attn.kv_projection(lnx, proj_name="value"), "value_proj")
-    b, s, h, d = query.shape
+    for dense in (attn.query, attn.key, attn.value, attn.out):
+      if dense.quant is not None:
+        raise ValueError("gbrna_fused_attention does not support quantized projections.")
+
+    def project(dense, x):
+      # Use the kernel as a 2D [in, out] matrix. The output is then [B, S, H * D] in
+      # row-major layout, and XLA does not copy it to change the tiled layout.
+      w = jnp.asarray(dense.kernel[...], cfg.dtype)
+      w = w.reshape(-1, w.shape[-1]) if dense is attn.out else w.reshape(w.shape[0], -1)
+      y = jnp.dot(x, w, precision=cfg.matmul_precision)
+      if dense.bias is not None:
+        y = y + jnp.asarray(dense.bias[...], cfg.dtype).reshape(-1)
+      return y
+
+    query = checkpoint_name(project(attn.query, lnx), "query_proj")
+    key = checkpoint_name(project(attn.key, lnx), "key_proj")
+    value = checkpoint_name(project(attn.value, lnx), "value_proj")
 
     spec4 = attn._logical_to_mesh_axes(attn.query_axis_names)  # pylint: disable=protected-access
     if spec4[1] is not None or spec4[3] is not None:
@@ -242,6 +255,6 @@ class GbRnaEncoderLayer(nnx.Module):
     sharded_kernel = jax.shard_map(
         lambda q, k, v: kernel(q, k, v), mesh=self.mesh, in_specs=(spec3,) * 3, out_specs=spec3, check_vma=False
     )
-    out = sharded_kernel(*(x.reshape(b, s, h * d) for x in (query, key, value)))
-    out = checkpoint_name(out.reshape(b, s, h, d), "attention_out")
-    return attn.out_projection(out, out_sharding=out_sharding)
+    out = checkpoint_name(sharded_kernel(query, key, value), "attention_out")
+    out = project(attn.out, out)
+    return self._maybe_shard_with_logical(out, self.activation_axis_names)
